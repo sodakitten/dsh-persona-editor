@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import struct
 import sys
 import time
@@ -45,7 +46,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 APP_NAME = "人设编辑器"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
@@ -440,13 +441,14 @@ class Target:
             or config_path(config, "personasDir")
             or default_personas_dir()
         )
-        return cls(
+        target = cls(
             patch_file=Path(patch),
             personas_dir=Path(personas),
             preset_id=getattr(args, "preset", None) or config_text(config, "presetId") or None,
             preset_row_id=config_text(config, "presetRowId") or None,
             persona_row_id=getattr(args, "persona_row", None) or config_text(config, "personaRowId") or None,
         )
+        return target
 
 
 # ── YAML 行级编辑（与 DSH 侧插件同一套规则） ─────────────────────────────────
@@ -893,6 +895,12 @@ def newest_backup(patch_file: Path, backups_dir: Path) -> Path | None:
 def atomic_write(path: Path, text: str) -> None:
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     temporary.write_text(text, encoding="utf-8", newline="")
+    os.replace(temporary, path)
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(data)
     os.replace(temporary, path)
 
 
@@ -1830,12 +1838,308 @@ def _remove_preset_meta_line(lines: list[str], preset: dict, key: str) -> tuple[
 EDITABLE_META_RE = re.compile(r"selectedDefault|^\s*-\s+id:|^\s*(?:id|name|description|order):")
 
 
+# ── 会话记录里的 preset id（改名后老对话要能继续打开） ───────────────────────
+#
+# DSH 会把每个会话选用的 preset id 写进会话日志的头部记录
+# （`{"type":"session",...,"agentPreset":"test"}`），resume 时按这个 id 查表，
+# 找不到就报 `Unknown agent preset: test`。所以改 preset id 时必须把已有会话
+# 记录里的这个字段一起改掉。
+#
+# 会话日志是「一帧一条记录」的 zstd 拼接文件（每次追加写一个新 frame）。
+# 只重写含 `agentPreset` 的那几帧，其余帧逐字节保留；改完再读回来逐帧核对。
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+SESSION_HEADER_KEYS = ("agentPreset",)
+ZSTD_IMPORT_ERROR = ""  # filled in by zstd_codec(), shown by --check
+
+
+def zstd_codec() -> tuple[object, object] | None:
+    """(compress, decompress) for zstd, or None when unavailable.
+
+    Python 3.14+ has zstd in the standard library. On older versions the
+    package to prefer is `zstandard`: its C backend is a separate module name,
+    so a frozen exe picks it up cleanly (pyzstd wraps `backports.zstd`, whose
+    pure-Python fallback shadows the C extension once frozen). Whatever fails is
+    remembered so `--check` can say something better than "not available".
+    """
+    global ZSTD_IMPORT_ERROR
+    problems: list[str] = []
+    try:  # Python 3.14+ ships zstd in the standard library
+        from compression import zstd  # type: ignore[import-not-found]
+
+        return zstd.compress, zstd.decompress
+    except Exception as error:  # noqa: BLE001 - any import/runtime problem falls through
+        problems.append(_import_problem("compression.zstd", error))
+    try:
+        import zstandard
+
+        compressor = zstandard.ZstdCompressor()
+        decompressor = zstandard.ZstdDecompressor()
+
+        def compress(data: bytes) -> bytes:
+            return compressor.compress(data)
+
+        def decompress(data: bytes) -> bytes:
+            # A frame appended to a stream need not carry its content size, so
+            # go through a decompression object instead of the one-shot call.
+            return decompressor.decompressobj().decompress(data)
+
+        return compress, decompress
+    except Exception as error:  # noqa: BLE001
+        problems.append(_import_problem("zstandard", error))
+    try:
+        import pyzstd
+
+        return pyzstd.compress, pyzstd.decompress
+    except Exception as error:  # noqa: BLE001
+        problems.append(_import_problem("pyzstd", error))
+    ZSTD_IMPORT_ERROR = "；".join(problems)
+    return None
+
+
+def _import_problem(name: str, error: BaseException) -> str:
+    detail = f"{type(error).__name__}: {error}"
+    cause = error.__cause__ or error.__context__
+    if cause is not None and str(cause) not in detail:
+        detail += f"（起因：{type(cause).__name__}: {cause}）"
+    return f"{name} → {detail}"
+
+
+def split_zstd_frames(data: bytes) -> list[bytes]:
+    """Split a concatenated zstd stream into frames without decompressing."""
+    frames: list[bytes] = []
+    position = 0
+    total = len(data)
+    while position < total:
+        start = position
+        if data[position : position + 4] != ZSTD_MAGIC:
+            raise ValueError(f"第 {position} 字节不是 zstd 帧头")
+        position += 4
+        if position >= total:
+            raise ValueError("帧头不完整")
+        descriptor = data[position]
+        position += 1
+        fcs_flag = descriptor >> 6
+        single_segment = (descriptor >> 5) & 1
+        has_checksum = (descriptor >> 2) & 1
+        dict_id_flag = descriptor & 3
+        if not single_segment:
+            position += 1  # window descriptor
+        position += (0, 1, 2, 4)[dict_id_flag]
+        if fcs_flag == 0 and single_segment:
+            position += 1
+        else:
+            position += (0, 2, 4, 8)[fcs_flag]
+        while True:
+            if position + 3 > total:
+                raise ValueError("块头不完整")
+            header = data[position] | (data[position + 1] << 8) | (data[position + 2] << 16)
+            position += 3
+            last_block = header & 1
+            block_type = (header >> 1) & 3
+            block_size = header >> 3
+            position += 1 if block_type == 1 else block_size  # RLE blocks store one byte
+            if last_block:
+                break
+        if has_checksum:
+            position += 4
+        if position > total:
+            raise ValueError("帧结尾超出文件末尾")
+        frames.append(data[start:position])
+    return frames
+
+
+def dsh_home_for(patch_file: Path) -> Path | None:
+    """The DSH home directory a patch file belongs to (patch profiles/<name>/...).
+
+    Deliberately requires a `profiles` component in the path: a patch copied to
+    a scratch directory must never make this tool touch the real session store
+    (tests rely on that).
+    """
+    for candidate in [patch_file, *patch_file.parents]:
+        if candidate.name == "profiles":
+            return candidate.parent
+    return None
+
+
+def session_log_files(home: Path) -> list[Path]:
+    """Every session log under <home>/sessions (workspace dirs are one level deep)."""
+    root = Path(home) / "sessions"
+    if not root.is_dir():
+        return []
+    found: list[Path] = []
+    for workspace in sorted(root.iterdir()):
+        if not workspace.is_dir() or workspace.name.startswith("."):
+            continue
+        for session in sorted(workspace.iterdir()):
+            if not session.is_dir():
+                continue
+            for log in sorted(session.glob("session*.jsonl.zstd")):
+                found.append(log)
+    return found
+
+
+def retarget_sessions(
+    home: Path,
+    old_id: str,
+    new_id: str,
+    skip_recent_seconds: int = 120,
+) -> dict:
+    """Rewrite the preset id stored in existing session records.
+
+    Only frames whose JSON carries an `agentPreset` field naming `old_id` are
+    touched; every other frame is kept byte for byte. Sessions DSH wrote within
+    `skip_recent_seconds` are left alone (they are in use and would race), and
+    projection caches naming the old id are backed up and dropped so DSH folds
+    them again from the fixed log.
+    """
+    codec = zstd_codec()
+    result: dict = {
+        "available": codec is not None,
+        "logs": 0,
+        "frames": 0,
+        "caches": 0,
+        "skipped": [],
+        "backup": None,
+        "error": None,
+    }
+    if codec is None:
+        result["error"] = "本机没有可用的 zstd（Python 3.14+ 或 pyzstd），会话记录没有改"
+        return result
+    compress, decompress = codec
+    pattern = re.compile(rb'("agentPreset"\s*:\s*)"' + re.escape(old_id.encode("utf-8")) + rb'"')
+    now = time.time()
+    logs = session_log_files(home)
+    changed: list[tuple[Path, bytes, int, int]] = []
+    frames_touched = 0
+    skipped: list[str] = []
+    for log in logs:
+        try:
+            raw = log.read_bytes()
+        except OSError:
+            continue
+        if now - log.stat().st_mtime < skip_recent_seconds and pattern.search(
+            _safe_decompress(decompress, raw)
+        ):
+            skipped.append(log.parent.name)
+            continue
+        try:
+            frames = split_zstd_frames(raw)
+        except ValueError:
+            continue
+        rebuilt: list[bytes] = []
+        touched = 0
+        text_total = 0
+        for frame in frames:
+            try:
+                text = decompress(frame)
+            except Exception:  # noqa: BLE001 - not our frame
+                rebuilt.append(frame)
+                continue
+            text_total += len(text)
+            if not pattern.search(text):
+                rebuilt.append(frame)
+                continue
+            touched += 1
+            rebuilt.append(compress(pattern.sub(rb'\1"' + new_id.encode("utf-8") + b'"', text)))
+        if not touched:
+            continue
+        frames_touched += touched
+        # expected size of the fixed log's text: only the id got longer/shorter
+        expected = text_total + touched * (len(new_id.encode("utf-8")) - len(old_id.encode("utf-8")))
+        changed.append((log, b"".join(rebuilt), len(frames), expected))
+
+    if changed or skipped:
+        result["skipped"] = skipped
+
+    # Projection caches that still name the old id must go even when no log
+    # needed rewriting: DSH folds them again from the (already fixed) log.
+    cache_dir = Path(home) / "storages" / "session_projcache" / "sessions"
+    cache_stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
+    dropped = 0
+    if cache_dir.is_dir():
+        live = set(skipped)
+        for cache in sorted(cache_dir.glob("*.json")):
+            if cache.stem in live:
+                continue
+            try:
+                text = cache.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if f'"val": "{old_id}"' not in text and f'"val":"{old_id}"' not in text:
+                continue
+            try:
+                cache_backup = Path(home) / "preset-id-backups" / cache_stamp
+                cache_backup.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cache, cache_backup / f"{cache.stem}.projcache.json")
+                cache.unlink()
+                dropped += 1
+            except OSError:
+                continue
+    result["caches"] = dropped
+
+    if not changed:
+        return result
+
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
+    backup_root = Path(home) / "preset-id-backups" / stamp
+    for log, output, _, _ in changed:
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(log, backup_root / f"{log.parent.name}.jsonl.zstd")
+            atomic_write_bytes(log, output)
+        except OSError as error:
+            result["error"] = f"写入失败：{error}"
+            return result
+    result["backup"] = backup_root
+    result["logs"] = len(changed)
+
+    # Verify by re-reading: same frame count, no old id left, and the decoded
+    # text is exactly as long as the id substitution implies (a truncated frame
+    # would still decode without error, so the length is the real check).
+    ok = True
+    for log, _, original_frames, expected_text in changed:
+        try:
+            after = split_zstd_frames(log.read_bytes())
+        except (OSError, ValueError):
+            ok = False
+            break
+        if len(after) != original_frames:
+            ok = False
+            break
+        after_text = 0
+        for frame in after:
+            try:
+                text = decompress(frame)
+            except Exception:  # noqa: BLE001
+                continue
+            after_text += len(text)
+            if pattern.search(text):
+                ok = False
+                break
+        if not ok or after_text != expected_text:
+            ok = False
+            break
+    result["frames"] = frames_touched
+    if not ok:
+        result["error"] = "改完后核对不一致，请用备份还原"
+    return result
+
+
+def _safe_decompress(decompress: object, data: bytes) -> bytes:
+    try:
+        return decompress(data)  # type: ignore[operator]
+    except Exception:  # noqa: BLE001
+        return b""
+
+
 def edit_preset(
     target: Target,
     preset_id: str | None = None,
     name: str | None = None,
     description: str | None = None,
     order: int | str | None = None,
+    skip_sessions: bool = False,
 ) -> dict:
     """Edit a preset's metadata: id, display name, description, order.
 
@@ -1968,6 +2272,12 @@ def edit_preset(
             pass
         raise RuntimeError(f"写入失败：{error}") from error
 
+    sessions = None
+    if wanted_id and not skip_sessions:
+        home = dsh_home_for(target.patch_file)
+        if home is not None:
+            sessions = retarget_sessions(home, old_label, wanted_id)
+
     return {
         "ok": True,
         "old": old_label,
@@ -1978,10 +2288,34 @@ def edit_preset(
         "path": target.patch_file,
         "backup": backup,
         "selected_moved": selected_moved,
+        "sessions": sessions,
     }
 
 
 # ── 命令行 ───────────────────────────────────────────────────────────────────
+
+
+def describe_session_fix(report: dict | None) -> list[str]:
+    """Readable lines about what happened to the existing session records."""
+    if report is None:
+        return []
+    lines: list[str] = []
+    if not report.get("available"):
+        lines.append(f"对话记录未改：{report.get('error') or '本机没有可用的 zstd'}")
+        return lines
+    if report.get("logs"):
+        lines.append(f"已改 {report['logs']} 个对话记录里的 preset id（共 {report['frames']} 条记录，已备份）")
+    if report.get("caches"):
+        lines.append(f"顺手清掉 {report['caches']} 个投影缓存，DSH 会自己重建。")
+    if report.get("skipped"):
+        lines.append(f"跳过 {len(report['skipped'])} 个正在使用的对话（DSH 正开着，等它关掉再跑一次即可）")
+    if report.get("error"):
+        lines.append(f"注意：{report['error']}")
+    if report.get("backup"):
+        lines.append(f"对话记录备份：{report['backup']}")
+    if not lines:
+        lines.append("没有对话记录指向旧 id，不需要改动。")
+    return lines
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2013,6 +2347,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--select", action="store_true", help="新建后把 DSH 的 selectedDefault 指向它（同文件里有注册行才生效）")
     parser.add_argument("--delete-preset", metavar="ID", help="从补丁文件里删除一个 preset（留备份）")
+    parser.add_argument(
+        "--no-fix-sessions",
+        action="store_true",
+        help="改 preset id 时不改写已有对话记录（默认会改，否则那些对话会打不开）",
+    )
+    parser.add_argument(
+        "--retarget-sessions",
+        metavar="旧ID:新ID",
+        help="只改写对话记录里的 preset id（不动补丁文件），用于修已经改坏的老对话",
+    )
     return parser
 
 
@@ -2039,6 +2383,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.create_preset is not None
         or args.delete_preset
         or args.rename_preset is not None
+        or args.retarget_sessions
     )
     out: list[str] = []
 
@@ -2106,6 +2451,12 @@ def main(argv: list[str] | None = None) -> int:
             say(f"  当前人设：{len(info['text'])} 字符 / {len(info['text'].splitlines())} 行")
             others = [line for line in describe_presets(summary) if not line.startswith(f"{info['preset_label']}（")]
             say(f"  同文件其他 preset：{'、'.join(others) if others else '无'}")
+            home = dsh_home_for(target.patch_file)
+            say(
+                "  对话记录："
+                + (f"{home}（改 preset id 时会一并改写）" if home is not None else "不在 profiles 目录下，改 id 时不碰对话记录")
+            )
+            say(f"  改写对话记录所需 zstd：{'可用' if zstd_codec() else '不可用 —— ' + ZSTD_IMPORT_ERROR}")
             say(
                 f"  人设文件：{len(files)} 个"
                 + ("（" + "、".join(item["name"] for item in files) + "）" if files else "")
@@ -2187,6 +2538,7 @@ def main(argv: list[str] | None = None) -> int:
                 name=args.preset_name,
                 description=args.preset_description,
                 order=order,
+                skip_sessions=args.no_fix_sessions,
             )
             if result["old"] != result["new"]:
                 say(f"preset id：{result['old']} → {result['new']}")
@@ -2197,6 +2549,23 @@ def main(argv: list[str] | None = None) -> int:
             if result["selected_moved"]:
                 say("DSH 的 selectedDefault 已跟着指向新 id。")
             say(f"备份：{result['backup']}")
+            for line in describe_session_fix(result.get("sessions")):
+                say(line)
+            return flush(action, out)
+
+        if args.retarget_sessions:
+            if ":" not in args.retarget_sessions:
+                say("格式：--retarget-sessions 旧ID:新ID（例如 test:dafeiyu）")
+                return flush(action, out, 1)
+            old_id, _, new_id = args.retarget_sessions.partition(":")
+            old_id, new_id = old_id.strip(), new_id.strip()
+            home = dsh_home_for(target.patch_file)
+            if not old_id or not new_id or home is None:
+                say("找不到 DSH 家目录（补丁文件不在 profiles 目录下），没有改动。")
+                return flush(action, out, 1)
+            say(f"改写 {home} 下对话记录里的 preset id：{old_id} → {new_id}")
+            for line in describe_session_fix(retarget_sessions(home, old_id, new_id)):
+                say(line)
             return flush(action, out)
 
         if args.set_file:
@@ -2250,6 +2619,7 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
             self.chosen: dict[str, str] = {}
 
             root.title(f"{APP_NAME} {APP_VERSION}")
+            root.geometry("1060x720")
             root.minsize(780, 520)
 
             outer = ttk.Frame(root, padding=10)
@@ -2583,11 +2953,14 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
                 self.set_preset_choice(self.preset_index(result["new"]), remember=True)
                 self.load_from_patch()
                 moved = "　DSH 选中项已跟着更新" if result["selected_moved"] else ""
+                sessions = describe_session_fix(result.get("sessions"))
                 self.set_status(
                     f"已更新 preset「{result['new']}」"
                     f"{'（原 ' + result['old'] + '）' if result['old'] != result['new'] else ''}{moved}"
                     f"　备份 {result['backup'].name}"
                 )
+                if sessions and result["old"] != result["new"]:
+                    messagebox.showinfo("预设信息已更新", "\n".join(sessions), parent=self.root)
 
             buttons = ttk.Frame(frame)
             buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))

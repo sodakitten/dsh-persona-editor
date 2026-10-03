@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -681,6 +682,100 @@ code = persona_editor.main(
 check("CLI 改名退出码为 0", code == 0)
 cli_lines = split_text(cli_file.read_text(encoding="utf-8"))["lines"]
 check("CLI 改名生效", any(p["preset_id"] == "empty-two" and p["name"] == "空空如也" for p in list_presets(cli_lines)))
+
+# ── 18. 改 id 时同步改写对话记录（老对话要能继续打开） ──────────────────────
+from persona_editor import (  # noqa: E402
+    dsh_home_for,
+    retarget_sessions,
+    session_log_files,
+    split_zstd_frames,
+    zstd_codec,
+)
+
+codec = zstd_codec()
+check("本机有 zstd 支持（pyzstd 或 Python 3.14+）", codec is not None, "没有 zstd，会话改写功能不可用")
+if codec is not None:
+    zstd_compress, zstd_decompress = codec
+
+    # a scratch DSH home: patch lives under profiles/, sessions under sessions/
+    home = work / "fake-dsh"
+    profile = home / "profiles" / "desktop"
+    profile.mkdir(parents=True)
+    fake_patch = profile / "cordis.patch.yml"
+    fake_patch.write_text("[]\n", encoding="utf-8")
+    check("补丁在 profiles 下能认出 DSH 家目录", dsh_home_for(fake_patch) == home)
+    check("临时目录里的补丁不会牵出真实家目录", dsh_home_for(work / "meta.patch.yml") is None)
+
+    def make_log(workspace: str, session: str, frames: list[str]) -> Path:
+        log = home / "sessions" / workspace / session / "session.v4.jsonl.zstd"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_bytes(b"".join(zstd_compress(frame.encode("utf-8")) for frame in frames))
+        return log
+
+    def age(path: Path, seconds: int = 600) -> None:
+        """Make a session look idle (the tool skips ones DSH wrote just now)."""
+        when = time.time() - seconds
+        os.utime(path, (when, when))
+
+    header = '{"type":"session","version":4,"id":"session-aaa","agentPreset":"old-id"}'
+    switch = '{"type":"agent-preset/selected","seq":3,"data":{"agentPreset":"old-id"}}'
+    other = '{"type":"assistant/message","seq":4,"data":{"message":"old-id 这串文字不该被改"}}'
+    log = make_log("--D-work--", "session-aaa", [header, switch, other])
+    age(log)
+    original_frames = split_zstd_frames(log.read_bytes())
+    check("会话日志按帧拆开", len(original_frames) == 3, str(len(original_frames)))
+
+    # a session DSH is using right now must be left alone
+    live = make_log("--D-live--", "session-live", ['{"type":"session","id":"session-live","agentPreset":"old-id"}'])
+    live_bytes = live.read_bytes()
+    report = retarget_sessions(home, "old-id", "new-id")
+    check("正在使用的对话被跳过", report["skipped"] == ["session-live"], str(report["skipped"]))
+    check("改写了 1 个对话记录、2 条记录", report["logs"] == 1 and report["frames"] == 2, str(report))
+    check("跳过的那个一个字没动", live.read_bytes() == live_bytes)
+    fixed_frames = split_zstd_frames(log.read_bytes())
+    check("帧数不变", len(fixed_frames) == 3)
+    check("头部记录改了 id", '"agentPreset":"new-id"' in zstd_decompress(fixed_frames[0]).decode("utf-8"))
+    check("切换事件也改了", '"agentPreset":"new-id"' in zstd_decompress(fixed_frames[1]).decode("utf-8"))
+    check("无关帧逐字节没动", fixed_frames[2] == original_frames[2])
+    check("正文里的同名文字没被动", b"old-id" in zstd_decompress(fixed_frames[2]))
+    check("改动留了备份", report["backup"] is not None and (report["backup"] / "session-aaa.jsonl.zstd").is_file())
+    check(
+        "备份里保留的是旧 id",
+        b"old-id" in zstd_decompress(split_zstd_frames((report["backup"] / "session-aaa.jsonl.zstd").read_bytes())[0]),
+    )
+
+    # projection caches naming the old id get dropped so DSH re-folds them
+    cache_dir = home / "storages" / "session_projcache" / "sessions"
+    cache_dir.mkdir(parents=True)
+    cache = cache_dir / "session-aaa.json"
+    cache.write_text('{"version":7,"record":{"rows":{"agentPreset":{"val": "old-id"}}}}', encoding="utf-8")
+    stale = cache_dir / "session-bbb.json"
+    stale.write_text('{"version":7,"record":{"rows":{"agentPreset":{"val": "untouched"}}}}', encoding="utf-8")
+    age(log)  # the rewrite refreshed its mtime; treat it as idle again
+    again = retarget_sessions(home, "old-id", "new-id")
+    check("缓存里还有旧 id 就会被清掉", again["caches"] == 1 and not cache.exists(), str(again["caches"]))
+    check("没提到旧 id 的缓存保留", stale.exists())
+    check("已改过的记录不会重复改", again["logs"] == 0, str(again["logs"]))
+
+    # the CLI entry point works too
+    cli_code = persona_editor.main(
+        ["--patch", str(fake_patch), "--personas", str(work / "s-personas"), "--retarget-sessions", "new-id:newer-id"]
+    )
+    check("--retarget-sessions 退出码为 0", cli_code == 0)
+    check(
+        "命令行只动会话、不动补丁文件",
+        fake_patch.read_text(encoding="utf-8") == "[]\n" and b"newer-id" in zstd_decompress(split_zstd_frames(log.read_bytes())[0]),
+    )
+    check("会话日志枚举只认 session*.jsonl.zstd", session_log_files(home) and all(p.suffix == ".zstd" for p in session_log_files(home)))
+
+    # no zstd at all: report instead of pretending
+    real_codec = persona_editor.zstd_codec
+    persona_editor.zstd_codec = lambda: None
+    try:
+        unavailable = retarget_sessions(home, "newer-id", "final-id")
+        check("没有 zstd 时如实报告、不动文件", unavailable["available"] is False and unavailable["logs"] == 0, str(unavailable["error"]))
+    finally:
+        persona_editor.zstd_codec = real_codec
 
 print(f"\nworkdir: {work}")
 print("ALL CHECKS PASSED" if failures == 0 else f"{failures} CHECK(S) FAILED")

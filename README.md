@@ -11,7 +11,7 @@
 | `dist\人设编辑.exe` | 双击即用：图形界面 |
 | `dist\人设编辑-cli.exe` | 带控制台的版本，供脚本/批处理调用（输出也会同时写进 `人设编辑.log`） |
 
-两个都是免安装单文件（约 10 MB），换台机器直接拷过去也能用。人设文件默认放在 **exe 同目录的 `personas\`**（整个文件夹拷走，人设跟着走）。
+两个都是免安装单文件（约 12 MB），换台机器直接拷过去也能用。人设文件默认放在 **exe 同目录的 `personas\`**（整个文件夹拷走，人设跟着走）。
 
 > 不想自己打包：去 [Releases](../../releases) 下载现成的 zip，解压即用。
 
@@ -55,6 +55,22 @@
 
 写入前照常整份校验（只允许这几类行变化、preset 队列和 persona 行必须原样）+ 自动备份。
 
+## 改 preset id 会顺带修好老对话
+
+DSH 把每个会话选用的 preset id 记在**会话记录的开头**，恢复对话时按这个 id 查表——**id 一改，那些老对话就会报 `Unknown agent preset: …` 打不开**。所以改 id 时这个工具会多做一步：
+
+- 把 DSH 家目录 `sessions\` 下所有对话记录里指向旧 id 的记录**就地改写**成新 id：只动含 `agentPreset` 的那几条，其余帧逐字节保留，帧结构和原来完全一致；
+- 再把投影缓存里还留着旧 id 的条目清掉（先备份再删），DSH 会自己从改好的记录重建；
+- **正在使用的对话会跳过**（DSH 刚写过、最近两分钟内有改动的），并告诉你跳过了哪几个——等 DSH 关掉后再跑一次即可；
+- 改写前备份到 `<DSH 家目录>\preset-id-backups\<时间戳>\`，写完全部回读核对（帧数 + 文本长度），不一致就提示用备份还原。
+
+补丁文件不在 `profiles\` 目录下（比如被人拷到别处）时，**不会**去动任何对话记录。只想修对话、不想碰补丁文件，或者反过来：
+
+```powershell
+人设编辑-cli.exe --retarget-sessions 旧ID:新ID              # 只改写对话记录，不动补丁文件
+人设编辑-cli.exe --rename-preset new-id --no-fix-sessions   # 只改 id，不动对话记录
+```
+
 ## 新建预设（把一个 preset 变成属于你自己的）
 
 点 **`新建预设…`**：填一个 preset id、显示名，选一个**模板**，确定后程序会在当前补丁文件末尾追加一个全新的 preset 声明，人设用编辑框里的正文（也可以让它生成一段开头）。创建完自动选中新 preset，DSH 一两秒内热加载，马上能编辑、能保存。
@@ -93,9 +109,10 @@
 人设编辑-cli.exe --delete-preset my-persona                                # 删除（留备份）
 
 # 编辑 preset 的 id / 显示名 / 说明 / 排序
-人设编辑-cli.exe --rename-preset new-id                     # 改 id（加载行、config.id、选中项一起改）
+人设编辑-cli.exe --rename-preset new-id                     # 改 id（加载行、config.id、选中项、老对话记录一起改）
 人设编辑-cli.exe --preset test --preset-name 新名字          # 只改显示名（id 不动）
 人设编辑-cli.exe --rename-preset new-id --preset-name 名字 --preset-description 说明 --preset-order 3
+人设编辑-cli.exe --retarget-sessions test:dafeiyu            # 只把对话记录里的旧 id 改成新的
 ```
 
 ## 配置（可选）
@@ -121,9 +138,10 @@
 ## 自己重新打包
 
 ```powershell
-powershell -File build.ps1      # 需要 python（3.10+）+ pyinstaller 6.x，产出 dist\ 下的两个 exe
-python selftest.py              # 115 项自测：发现、解析、写入、零漂移、CRLF、撤销、配置、
-                                # 新建/删除/编辑 preset、asar 读取、GUI 切换
+powershell -File build.ps1      # 产出 dist\ 下的两个 exe
+                                # 需要 python（3.10+）+ pyinstaller 6.x
+python selftest.py              # 137 项自测：发现、解析、写入、零漂移、CRLF、撤销、配置、
+                                # 新建/删除/编辑 preset、会话记录改写、asar 读取、GUI 切换
 ```
 
-自测全部在临时目录里对**副本**操作，从不写真实的 `cordis.patch.yml`；最后一项检查只读地验证本机真实文件能否自动识别。
+自测全部在临时目录里对**副本**操作，从不写真实的 `cordis.patch.yml`；会话改写那几项也是在一个临时的假 DSH 家目录里跑的，碰不到真实对话记录。最后一项检查只读地验证本机真实文件能否自动识别。

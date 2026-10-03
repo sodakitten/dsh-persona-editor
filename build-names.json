@@ -1,0 +1,6 @@
+{
+  "gui": "人设编辑.exe",
+  "cli": "人设编辑-cli.exe",
+  "gui_stem": "人设编辑",
+  "cli_stem": "人设编辑-cli"
+}
