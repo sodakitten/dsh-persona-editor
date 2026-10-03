@@ -46,7 +46,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 APP_NAME = "人设编辑器"
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
@@ -1762,34 +1762,58 @@ def dsh_process_names() -> list[str]:
     return found
 
 
-def recent_session_activity(home: Path | None, seconds: int = 60) -> list[str]:
-    """Session logs written within the last `seconds` — DSH is doing something."""
+def session_writer_activity(home: Path | None, seconds: int = 30, pause: float = 1.2) -> list[str]:
+    """Session logs that are *still* being written right now.
+
+    DSH flushes every open session when it shuts down, leaving a burst of fresh
+    mtimes behind with nothing running — so one recent write proves nothing.
+    Sample twice and only count a log that changed between the samples; the
+    pause only happens when something looked recent.
+    """
     if home is None:
         return []
+    before = _session_signatures(home, seconds)
+    if not before:
+        return []
+    time.sleep(pause)
+    return live_writers(before, _session_signatures(home, seconds))
+
+
+def _session_signatures(home: Path, seconds: int) -> dict[Path, tuple[int, int]]:
+    """(mtime_ns, size) of every session log touched in the last `seconds`."""
     cutoff = time.time() - seconds
-    active: list[str] = []
+    found: dict[Path, tuple[int, int]] = {}
     for log in session_log_files(home):
         try:
-            if log.stat().st_mtime >= cutoff:
-                active.append(log.parent.name)
+            info = log.stat()
         except OSError:
             continue
-    return active
+        if info.st_mtime >= cutoff:
+            found[log] = (info.st_mtime_ns, info.st_size)
+    return found
+
+
+def live_writers(
+    before: dict[Path, tuple[int, int]], after: dict[Path, tuple[int, int]]
+) -> list[str]:
+    """Session names whose log changed between two samples (pure, for tests)."""
+    return [log.parent.name for log, signature in before.items() if after.get(log) != signature]
 
 
 def dsh_is_running(home: Path | None) -> tuple[bool, str]:
     """(running, why) — is a DSH instance busy enough that an id change is unsafe?
 
-    Detected by the desktop process (and `dsh ...` helpers), plus any session
-    log written in the last minute, which also covers a `dsh web` started from
-    a terminal where no recognizable process name shows up.
+    The desktop process is the reliable signal. The session-log fallback covers
+    a `dsh web` started from a terminal (no recognizable process name there),
+    and it deliberately needs two samples so that the write burst from DSH's
+    own shutdown does not look like a running instance.
     """
     processes = dsh_process_names()
     if processes:
         return True, f"检测到 {len(processes)} 个 DSH 进程（{processes[0]}）"
-    active = recent_session_activity(home)
-    if active:
-        return True, f"刚有 {len(active)} 个对话在写入（{active[0]}）"
+    writers = session_writer_activity(home)
+    if writers:
+        return True, f"有对话正在写入（{writers[0]}）"
     return False, ""
 
 
@@ -1807,7 +1831,9 @@ def require_dsh_stopped(home: Path | None, what: str, force: bool) -> None:
     raise DshRunningError(
         f"{why}，所以现在不改{what}：改了以后已经存在的对话会指向不存在的 preset，"
         "在 DSH 里就打不开了。\n\n"
-        "请先退出 DSH（托盘也退），再重试；\n"
+        "请先退出 DSH（托盘也退），然后点「重试」；\n"
+        "注意：DSH 退出时会刷一遍会话日志，所以别刚关就从别的信号判断它还在跑 —— "
+        "这里会重新采样确认。\n"
         "确实要现在改就用命令行加 --force，改完关掉 DSH 后跑一次 "
         "--retarget-sessions 旧ID:新ID 收尾。"
     )
@@ -3076,8 +3102,9 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
             try:
                 result = remove_preset(self.target, label)
             except DshRunningError as error:
-                messagebox.showwarning("先退出 DSH", str(error), parent=self.root)
-                self.set_status("已拦住：DSH 正在运行，先退出再删。", error=True)
+                if messagebox.askretrycancel("先退出 DSH", f"{error}\n\n退出 DSH 后点「重试」。", parent=self.root):
+                    self.after(80, self.delete_current_preset)
+                self.set_status("已拦住：DSH 还在跑，退出后点重试。", error=True)
                 return
             except Exception as error:  # noqa: BLE001 - surfaced to the user
                 self.set_status(f"删除失败：{error}", error=True)
@@ -3153,8 +3180,9 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
                         order=order_text if order_text != old_order else None,
                     )
                 except DshRunningError as error:
-                    messagebox.showwarning("先退出 DSH", str(error), parent=dialog)
-                    self.set_status("已拦住：DSH 正在运行，改 id 前请先退出它。", error=True)
+                    if messagebox.askretrycancel("先退出 DSH", f"{error}\n\n退出 DSH 后点「重试」。", parent=dialog):
+                        self.after(80, submit)
+                    self.set_status("已拦住：DSH 还在跑，退出后点重试。", error=True)
                     return
                 except Exception as error:  # noqa: BLE001 - surfaced to the user
                     self.set_status(f"修改失败：{error}", error=True)
