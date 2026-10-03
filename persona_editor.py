@@ -46,7 +46,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 APP_NAME = "人设编辑器"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
@@ -1713,10 +1713,111 @@ def has_list_entries(lines: list[str]) -> bool:
     return False
 
 
-def remove_preset(target: Target, preset_id: str) -> dict:
+def dsh_process_names() -> list[str]:
+    """Names of running processes that look like a DSH instance.
+
+    Windows-only; anywhere else this reports nothing and the guard stays quiet.
+    """
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == INVALID_HANDLE_VALUE or snapshot is None:
+        return []
+    found: list[str] = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            name = entry.szExeFile or ""
+            lowered = name.lower()
+            if lowered.startswith("deepseek harness") or lowered.startswith("dsh"):
+                found.append(name)
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return found
+
+
+def recent_session_activity(home: Path | None, seconds: int = 60) -> list[str]:
+    """Session logs written within the last `seconds` — DSH is doing something."""
+    if home is None:
+        return []
+    cutoff = time.time() - seconds
+    active: list[str] = []
+    for log in session_log_files(home):
+        try:
+            if log.stat().st_mtime >= cutoff:
+                active.append(log.parent.name)
+        except OSError:
+            continue
+    return active
+
+
+def dsh_is_running(home: Path | None) -> tuple[bool, str]:
+    """(running, why) — is a DSH instance busy enough that an id change is unsafe?
+
+    Detected by the desktop process (and `dsh ...` helpers), plus any session
+    log written in the last minute, which also covers a `dsh web` started from
+    a terminal where no recognizable process name shows up.
+    """
+    processes = dsh_process_names()
+    if processes:
+        return True, f"检测到 {len(processes)} 个 DSH 进程（{processes[0]}）"
+    active = recent_session_activity(home)
+    if active:
+        return True, f"刚有 {len(active)} 个对话在写入（{active[0]}）"
+    return False, ""
+
+
+class DshRunningError(RuntimeError):
+    """Raised when an operation is refused because DSH is running."""
+
+
+def require_dsh_stopped(home: Path | None, what: str, force: bool) -> None:
+    """Refuse the dangerous operations while DSH is running."""
+    if force:
+        return
+    running, why = dsh_is_running(home)
+    if not running:
+        return
+    raise DshRunningError(
+        f"{why}，所以现在不改{what}：改了以后已经存在的对话会指向不存在的 preset，"
+        "在 DSH 里就打不开了。\n\n"
+        "请先退出 DSH（托盘也退），再重试；\n"
+        "确实要现在改就用命令行加 --force，改完关掉 DSH 后跑一次 "
+        "--retarget-sessions 旧ID:新ID 收尾。"
+    )
+
+
+def remove_preset(target: Target, preset_id: str, force: bool = False) -> dict:
     """Take a preset declaration out of the target file, keeping a backup."""
     if not target.patch_file.is_file():
         raise FileNotFoundError(f"补丁文件不存在：{target.patch_file}")
+    require_dsh_stopped(dsh_home_for(target.patch_file), f"（删掉 preset「{preset_id}」后，用到它的对话会打不开）", force)
     original = read_text_exact(target.patch_file)
     parts = split_text(original)
     lines = parts["lines"]
@@ -2140,16 +2241,23 @@ def edit_preset(
     description: str | None = None,
     order: int | str | None = None,
     skip_sessions: bool = False,
+    force: bool = False,
 ) -> dict:
     """Edit a preset's metadata: id, display name, description, order.
 
     Passing None keeps a field as it is. An empty string removes the
     name/description/order line. Changing the id rewrites both the loader row
     (`- id: preset-...`) and `config.id`, moves the registry's selectedDefault
-    when it pointed here, and refuses ids some other preset already uses.
+    when it pointed here, refuses ids some other preset already uses, and
+    rewrites the existing session records that named the old id.
+
+    Renaming (and deleting) is refused while DSH is running unless `force` is
+    set: those are the two operations that can orphan an existing conversation.
     """
     if not target.patch_file.is_file():
         raise FileNotFoundError(f"补丁文件不存在：{target.patch_file}")
+    home = dsh_home_for(target.patch_file)
+    wanted = (preset_id or "").strip()
     original = read_text_exact(target.patch_file)
     parts = split_text(original)
     lines = parts["lines"]
@@ -2167,6 +2275,7 @@ def edit_preset(
 
     wanted_id = (preset_id or "").strip()
     if wanted_id and wanted_id != old_label:
+        require_dsh_stopped(home, f" preset id（{old_label} → {wanted_id}）", force)
         if not PRESET_ID_RE.match(wanted_id):
             raise ValueError("preset id 只能用小写字母、数字和连字符（例如 my-persona）")
         owner = preset_id_owner(wanted_id, target)
@@ -2274,7 +2383,6 @@ def edit_preset(
 
     sessions = None
     if wanted_id and not skip_sessions:
-        home = dsh_home_for(target.patch_file)
         if home is not None:
             sessions = retarget_sessions(home, old_label, wanted_id)
 
@@ -2293,6 +2401,88 @@ def edit_preset(
 
 
 # ── 命令行 ───────────────────────────────────────────────────────────────────
+
+
+def stale_session_presets(home: Path | None, known_ids: set[str]) -> dict[str, list[str]]:
+    """Session logs whose preset id is not defined anywhere: id -> session names.
+
+    These are the conversations that will answer `Unknown agent preset` when
+    opened, which is exactly what a rename used to leave behind.
+    """
+    if home is None:
+        return {}
+    codec = zstd_codec()
+    if codec is None:
+        return {}
+    _, decompress = codec
+    pattern = re.compile(rb'"agentPreset"\s*:\s*"([^"]+)"')
+    stale: dict[str, list[str]] = {}
+    for log in session_log_files(home):
+        try:
+            frames = split_zstd_frames(log.read_bytes())
+        except (OSError, ValueError):
+            continue
+        header_id = ""
+        try:
+            header_id = json.loads(decompress(frames[0]).decode("utf-8")).get("agentPreset") or ""
+        except Exception:  # noqa: BLE001
+            continue
+        if not header_id or header_id in known_ids:
+            continue
+        # only report it when the *effective* preset (last switch) is missing too
+        effective = header_id
+        for frame in frames:
+            try:
+                text = decompress(frame)
+            except Exception:  # noqa: BLE001
+                continue
+            for value in pattern.findall(text):
+                effective = value.decode("utf-8", "replace")
+        if effective in known_ids:
+            continue
+        stale.setdefault(effective, []).append(log.parent.name)
+    return stale
+
+
+def known_preset_ids() -> set[str]:
+    """Every preset id this machine can actually resolve.
+
+    Session records only store `config.id` of the preset they ran, so both the
+    loader row ids (`preset-xxx`) and the config ids are collected, from the
+    patch files on disk *and* from the presets DSH ships inside app.asar
+    (`standard` and friends live there, not in any patch file).
+    """
+    known: set[str] = set()
+    for entry in discover_patch_files():
+        for candidate in entry.get("presets") or []:
+            label = preset_label(candidate)
+            if label:
+                known.add(label)
+            row_id = candidate.get("row_id")
+            if row_id:
+                known.add(row_id)
+    for template in shipped_preset_templates():
+        label = preset_label(template.get("preset") or template)
+        if label:
+            known.add(label)
+    return known
+
+
+def _describe_stale_sessions(home: Path | None) -> str:
+    """One line (plus details) about conversations whose preset id is gone."""
+    if home is None:
+        return "不在 profiles 目录下，没检查"
+    if zstd_codec() is None:
+        return "本机没有 zstd，没检查"
+    stale = stale_session_presets(home, known_preset_ids())
+    if not stale:
+        return "无（每个对话的 preset id 都还在）"
+    total = sum(len(names) for names in stale.values())
+    lines = [f"{total} 个 —— preset id 已经不存在了，这些对话打不开"]
+    for preset_id, names in sorted(stale.items()):
+        lines.append(f"      * 「{preset_id}」：{len(names)} 个（例如 {names[0]}）")
+    lines.append("      先退出 DSH，再跑：人设编辑-cli.exe --retarget-sessions 旧ID:新ID")
+    return "\n".join(lines)
 
 
 def describe_session_fix(report: dict | None) -> list[str]:
@@ -2356,6 +2546,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--retarget-sessions",
         metavar="旧ID:新ID",
         help="只改写对话记录里的 preset id（不动补丁文件），用于修已经改坏的老对话",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="DSH 在运行时也照改（改 preset id / 删 preset / 修对话记录默认会被拒绝）",
     )
     return parser
 
@@ -2457,6 +2652,9 @@ def main(argv: list[str] | None = None) -> int:
                 + (f"{home}（改 preset id 时会一并改写）" if home is not None else "不在 profiles 目录下，改 id 时不碰对话记录")
             )
             say(f"  改写对话记录所需 zstd：{'可用' if zstd_codec() else '不可用 —— ' + ZSTD_IMPORT_ERROR}")
+            running, why = dsh_is_running(home)
+            say(f"  DSH 状态：{'正在运行 —— ' + why if running else '没在运行（改 id / 删 preset 现在可以做）'}")
+            say(f"  打不开的对话：{_describe_stale_sessions(home)}")
             say(
                 f"  人设文件：{len(files)} 个"
                 + ("（" + "、".join(item["name"] for item in files) + "）" if files else "")
@@ -2513,7 +2711,7 @@ def main(argv: list[str] | None = None) -> int:
             return flush(action, out)
 
         if args.delete_preset:
-            result = remove_preset(target, args.delete_preset)
+            result = remove_preset(target, args.delete_preset, force=args.force)
             say(f"已删除 preset「{result['removed']}」")
             if result["dropped_insert_block"]:
                 say("整个 - insert: 块已一并移除。")
@@ -2539,6 +2737,7 @@ def main(argv: list[str] | None = None) -> int:
                 description=args.preset_description,
                 order=order,
                 skip_sessions=args.no_fix_sessions,
+                force=args.force,
             )
             if result["old"] != result["new"]:
                 say(f"preset id：{result['old']} → {result['new']}")
@@ -2562,6 +2761,11 @@ def main(argv: list[str] | None = None) -> int:
             home = dsh_home_for(target.patch_file)
             if not old_id or not new_id or home is None:
                 say("找不到 DSH 家目录（补丁文件不在 profiles 目录下），没有改动。")
+                return flush(action, out, 1)
+            try:
+                require_dsh_stopped(home, " 对话记录", args.force)
+            except RuntimeError as error:
+                say(str(error))
                 return flush(action, out, 1)
             say(f"改写 {home} 下对话记录里的 preset id：{old_id} → {new_id}")
             for line in describe_session_fix(retarget_sessions(home, old_id, new_id)):
@@ -2871,6 +3075,10 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
                 return
             try:
                 result = remove_preset(self.target, label)
+            except DshRunningError as error:
+                messagebox.showwarning("先退出 DSH", str(error), parent=self.root)
+                self.set_status("已拦住：DSH 正在运行，先退出再删。", error=True)
+                return
             except Exception as error:  # noqa: BLE001 - surfaced to the user
                 self.set_status(f"删除失败：{error}", error=True)
                 return
@@ -2944,6 +3152,10 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
                         description=desc_text if desc_text != old_description else None,
                         order=order_text if order_text != old_order else None,
                     )
+                except DshRunningError as error:
+                    messagebox.showwarning("先退出 DSH", str(error), parent=dialog)
+                    self.set_status("已拦住：DSH 正在运行，改 id 前请先退出它。", error=True)
+                    return
                 except Exception as error:  # noqa: BLE001 - surfaced to the user
                     self.set_status(f"修改失败：{error}", error=True)
                     return

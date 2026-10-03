@@ -42,6 +42,11 @@ from persona_editor import (  # noqa: E402
 failures = 0
 
 
+# The guard that refuses preset-id changes while DSH runs would trip on the
+# machine running this suite; the guard itself gets its own tests further down.
+persona_editor.dsh_is_running = lambda home=None: (False, "")
+
+
 def check(label: str, condition: bool, detail: str = "") -> None:
     global failures
     ok = bool(condition)

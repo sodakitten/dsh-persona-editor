@@ -61,14 +61,39 @@ DSH 把每个会话选用的 preset id 记在**会话记录的开头**，恢复�
 
 - 把 DSH 家目录 `sessions\` 下所有对话记录里指向旧 id 的记录**就地改写**成新 id：只动含 `agentPreset` 的那几条，其余帧逐字节保留，帧结构和原来完全一致；
 - 再把投影缓存里还留着旧 id 的条目清掉（先备份再删），DSH 会自己从改好的记录重建；
-- **正在使用的对话会跳过**（DSH 刚写过、最近两分钟内有改动的），并告诉你跳过了哪几个——等 DSH 关掉后再跑一次即可；
 - 改写前备份到 `<DSH 家目录>\preset-id-backups\<时间戳>\`，写完全部回读核对（帧数 + 文本长度），不一致就提示用备份还原。
 
-补丁文件不在 `profiles\` 目录下（比如被人拷到别处）时，**不会**去动任何对话记录。只想修对话、不想碰补丁文件，或者反过来：
+补丁文件不在 `profiles\` 目录下（比如被人拷到别处）时，**不会**去动任何对话记录。
+
+### 改 id / 删 preset 要求 DSH 先退出
+
+这两件事会让已经存在的对话指向不存在的 preset，所以**检测到 DSH 正在运行时会直接拒绝**。改人设正文、显示名、说明、排序不受影响，照旧热加载：
+
+```
+失败：检测到 6 个 DSH 进程（DeepSeek Harness.exe），所以现在不改 preset id（a → b）：
+改了以后已经存在的对话会指向不存在的 preset，在 DSH 里就打不开了。
+请先退出 DSH（托盘也退），再重试；确实要现在改就用命令行加 --force，
+改完关掉 DSH 后跑一次 --retarget-sessions 旧ID:新ID 收尾。
+```
+
+判断依据是 DSH 进程，外加"最近一分钟有会话在写入"（这条覆盖从终端起的 `dsh web`）。确实要边跑边改就加 `--force`，代价是可能留下要收尾的对话。
+
+### 体检：哪些对话已经打不开了
+
+`--check` 会顺便扫一遍所有对话，把**指向已不存在 preset id** 的那些列出来（"头部是旧 id、后来切回已有 preset"这种其实打得开的，不会误报）：
+
+```
+打不开的对话：1 个 —— preset id 已经不存在了
+  * 「dafeiyu」：1 个（例如 session-fb912083-6747-464a-a739-1fa2b319750b）
+  先退出 DSH，再跑：人设编辑-cli.exe --retarget-sessions 旧ID:新ID
+```
+
+只想修对话、不想碰补丁文件，或者反过来：
 
 ```powershell
 人设编辑-cli.exe --retarget-sessions 旧ID:新ID              # 只改写对话记录，不动补丁文件
 人设编辑-cli.exe --rename-preset new-id --no-fix-sessions   # 只改 id，不动对话记录
+人设编辑-cli.exe --rename-preset new-id --force             # DSH 开着也改（改完记得收尾）
 ```
 
 ## 新建预设（把一个 preset 变成属于你自己的）
@@ -140,8 +165,8 @@ DSH 把每个会话选用的 preset id 记在**会话记录的开头**，恢复�
 ```powershell
 powershell -File build.ps1      # 产出 dist\ 下的两个 exe
                                 # 需要 python（3.10+）+ pyinstaller 6.x
-python selftest.py              # 137 项自测：发现、解析、写入、零漂移、CRLF、撤销、配置、
-                                # 新建/删除/编辑 preset、会话记录改写、asar 读取、GUI 切换
+python selftest.py              # 157 项自测：发现、解析、写入、零漂移、CRLF、撤销、配置、
+                                # 新建/删除/编辑 preset、会话记录改写、asar 读取、DSH 运行时守卫、GUI 切换
 ```
 
 自测全部在临时目录里对**副本**操作，从不写真实的 `cordis.patch.yml`；会话改写那几项也是在一个临时的假 DSH 家目录里跑的，碰不到真实对话记录。最后一项检查只读地验证本机真实文件能否自动识别。
