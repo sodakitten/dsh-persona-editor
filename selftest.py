@@ -782,6 +782,15 @@ if codec is not None:
     finally:
         persona_editor.zstd_codec = real_codec
 
+# 19. Live writer comparison: deleted files are not writers; newly created logs are.
+from persona_editor import live_writers
+writer_a = work / "session-a" / "session.v4.jsonl.zstd"
+writer_b = work / "session-b" / "session.v4.jsonl.zstd"
+check("退出后不变的日志不算写入", live_writers({writer_a: (1, 20)}, {writer_a: (1, 20)}) == [])
+check("消失的日志不误判为写入", live_writers({writer_a: (1, 20)}, {}) == [])
+check("采样间新建的日志算正在写入", live_writers({}, {writer_b: (2, 30)}) == ["session-b"])
+check("增长的日志算正在写入", live_writers({writer_a: (1, 20)}, {writer_a: (2, 30)}) == ["session-a"])
+
 print(f"\nworkdir: {work}")
 print("ALL CHECKS PASSED" if failures == 0 else f"{failures} CHECK(S) FAILED")
 raise SystemExit(0 if failures == 0 else 1)

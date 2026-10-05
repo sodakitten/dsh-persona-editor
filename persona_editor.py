@@ -46,7 +46,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 APP_NAME = "人设编辑器"
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.1.4"
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
@@ -1731,7 +1731,7 @@ def dsh_process_names() -> list[str]:
             ("dwSize", wintypes.DWORD),
             ("cntUsage", wintypes.DWORD),
             ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32DefaultHeapID", ctypes.c_size_t),
             ("th32ModuleID", wintypes.DWORD),
             ("cntThreads", wintypes.DWORD),
             ("th32ParentProcessID", wintypes.DWORD),
@@ -1743,6 +1743,12 @@ def dsh_process_names() -> list[str]:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE or snapshot is None:
         return []
@@ -1797,7 +1803,7 @@ def live_writers(
     before: dict[Path, tuple[int, int]], after: dict[Path, tuple[int, int]]
 ) -> list[str]:
     """Session names whose log changed between two samples (pure, for tests)."""
-    return [log.parent.name for log, signature in before.items() if after.get(log) != signature]
+    return sorted({log.parent.name for log, signature in after.items() if before.get(log) != signature})
 
 
 def dsh_is_running(home: Path | None) -> tuple[bool, str]:
@@ -3141,6 +3147,7 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
             id_entry = ttk.Entry(frame, width=30)
             id_entry.grid(row=0, column=1, sticky="we", pady=2)
             id_entry.insert(0, old_label)
+            id_entry.configure(state="readonly")
 
             ttk.Label(frame, text="显示名：").grid(row=1, column=0, sticky="w")
             name_entry = ttk.Entry(frame, width=30)
@@ -3159,7 +3166,7 @@ def run_gui(target: Target, headless: bool = False, probe=None) -> int:
 
             ttk.Label(
                 frame,
-                text="改动会整份校验并自动备份；改 id 时 DSH 的选中项会跟着更新。\n"
+                text="已有 ID 关联会话，图形界面不再修改 ID；要换 ID 请新建预设。\n"
                      "留空的说明/排序会被删掉这一项。",
                 foreground="#666",
                 wraplength=430,

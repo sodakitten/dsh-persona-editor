@@ -1,0 +1,5 @@
+- insert:
+    - id: dsh-agent-preset-editor
+      name: dsh-agent-preset-editor
+      config:
+        plugins: []
