@@ -1,6 +1,6 @@
 # DSH 人设与 Agent 预设编辑器
 
-3.0.0 新增 **DSH 桌面端插件**。当前版本 **3.0.1** 修复了打开编辑窗口时从加载状态突然撑大、重新居中的抽动，并加入短暂淡入。建议使用插件：打开 **设置 → Agent 预设**，点击右上方 **编辑 Agent 预设**，直接修改人设、显示名称、说明和排序，或从现有预设复制新建。
+3.0.0 新增 **DSH 桌面端插件**。当前版本 **3.0.2** 沿用打开窗口时的固定尺寸与短暂淡入，并将设置入口改为 DSH 原生按钮，与“打开配置文件”的尺寸和样式一致。建议使用插件：打开 **设置 → Agent 预设**，点击右上方 **编辑 Agent 预设**，直接修改人设、显示名称、说明和排序，或从现有预设复制新建。
 
 插件在 [`plugin/`](plugin/)：使用 DSH 官方 `settings.action` 插槽、`configEditor.edit()`、Loader 和 Agent 预设注册表；不修改桌面安装文件，不改写会话日志。原生卡片、默认选择和配置查看继续保留。
 
@@ -11,10 +11,10 @@
 - 新预设保存为编辑器所持有的正式预设声明，重启后重新加载。停用或卸载插件后应重新启用它，才能恢复使用这些 ID 的会话。
 - 不包含任何私人人设文件。
 
-从 [Releases](https://github.com/sodakitten/dsh-persona-editor/releases) 下载 `dsh-agent-preset-editor-3.0.1.tgz`，用 DSH 插件管理器安装；或通过官方 CLI：
+从 [Releases](https://github.com/sodakitten/dsh-persona-editor/releases) 下载 `dsh-agent-preset-editor-3.0.2.tgz`，用 DSH 插件管理器安装；或通过官方 CLI：
 
 ```powershell
-dsh plugin --profile desktop add "file:C:/plugins/dsh-agent-preset-editor-3.0.1.tgz"
+dsh plugin --profile desktop add "file:C:/plugins/dsh-agent-preset-editor-3.0.2.tgz"
 ```
 
 适配与实测版本：DSH Desktop 0.2.0-rc.2。详细行为见 [插件说明](plugin/README.md)。

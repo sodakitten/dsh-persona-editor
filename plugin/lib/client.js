@@ -2,6 +2,7 @@ window.__ModuleLoader__.load({
   id: 'dsh-agent-preset-editor',
   factory(require) {
     const React = require('react'), h = React.createElement, NS = 'dsh-agent-preset-editor';
+    const { Button } = require('@deepseek-ai/dsh-client-ui-primitives');
     const zh = { open:'编辑 Agent 预设', title:'Agent 预设编辑器', preset:'预设', edit:'编辑现有预设', create:'复制为新预设', template:'模板',
       id:'预设 ID', name:'显示名称', description:'说明', order:'排序', persona:'人设段落', prefix:'前置人设提示词', suffix:'后置人设提示词',
       none:'新增人设段落', copy:'副本', save:'保存修改', add:'创建预设', close:'关闭', cancel:'取消', loading:'加载中…', saving:'正在保存…',
@@ -64,7 +65,7 @@ window.__ModuleLoader__.load({
       React.useEffect(()=>()=>store.close(),[store]);
       // Render within the native Settings action seat so its body-portaled modal
       // remains the owning focus and stacking context. The shell overlay is below Settings.
-      return h(React.Fragment,null,h('style',null,css),h('button',{type:'button',className:'dpe-button',onClick:()=>store.show()},t('open')),
+      return h(React.Fragment,null,h('style',null,css),h(Button,{type:'button',variant:'outline',size:'sm',onClick:()=>store.show()},t('open')),
         state.open?h(Editor,{store,t}):null);
     }
     function Editor({ store, t }) {
