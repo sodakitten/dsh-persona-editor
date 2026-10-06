@@ -1,4 +1,4 @@
-# DSH Agent 预设编辑器 3.0.0
+# DSH Agent 预设编辑器 3.0.1
 
 在 DSH 原生设置窗口右上方点击 **编辑 Agent 预设**。在 Agent 预设页也可直接使用这个入口。
 
@@ -13,10 +13,12 @@
 通过 DSH 插件管理器安装本目录或发布的 TGZ，或运行官方 CLI：
 
 ```powershell
-dsh plugin --profile desktop add "file:C:/plugins/dsh-agent-preset-editor-3.0.0.tgz"
+dsh plugin --profile desktop add "file:C:/plugins/dsh-agent-preset-editor-3.0.1.tgz"
 ```
 
 更新已有安装后按 DSH 提示重启。适配 DSH Desktop 0.2.0-rc.2。
+
+3.0.1 修复打开时的抽动：窗口从加载第一帧起保持相同尺寸，内部内容独立滚动；滚动条预留宽度，焦点切换不滚动背景。打开采用 120ms 淡入，遵循减少动态效果设置。
 
 ## 使用与限制
 

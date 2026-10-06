@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-preset-editor",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Edit and create Agent personas inside DeepSeek Harness settings using the official configuration editor",
   "type": "module",
   "main": "lib/index.js",
